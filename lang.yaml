@@ -277,4 +277,4 @@ music:
     Use `{QUAVER_DELIMITER}` to link notes within an icon, for triplets, quavers... (e.g. `A1{QUAVER_DELIMITER}B1{QUAVER_DELIMITER}C1`).
     Add `{REPEAT_INDICATOR}2` after a chord to indicate repetition.
 
-    `Sharps # and flats b (semitones) are not supported in Sky.`
+    `Sharps # and flats b (semitones) are supported in Western and Jianpu notations.`
