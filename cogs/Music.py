@@ -1,275 +1,255 @@
+import asyncio
 import os
 import re
-import sys
+from concurrent.futures import CancelledError
 
+from discord import Forbidden, File
 from discord.ext import commands
 
 from cogs.BaseCog import BaseCog
 
-from modes import InputModes, RenderModes, CSSModes
-from parsers import Parser
-from songs import Song
+try:
+    from modes import InputModes, RenderModes, CSSModes
+    from parsers import SongParser
+    from songs import Song
+except ImportError as e:
+    print(e)
 
-from utils import Lang, Emoji
+from utils import Lang, Emoji, Questions, Utils, Configuration
 
 
 class Music(BaseCog):
 
     def __init__(self, bot):
         super().__init__(bot)
-        # Parameters that can be changed by advanced users
-        self.QUAVER_DELIMITER = '-'  # Dash-separated list of chords
-        self.ICON_DELIMITER = ' '  # Chords separation
-        self.NOTE_WIDTH = "1em"  # Any CSS-compatible unit can be used
-        self.PAUSE = '.'
-        self.COMMENT_DELIMITER = '#'  # Lyrics delimiter, can be used for comments
-        self.REPEAT_INDICATOR = '*'
-        self.SONG_DIR_IN = 'songs'
-        self.SONG_DIR_OUT = 'songs'
-        self.CSS_PATH = 'css/main.css'
-        self.CSS_MODE = CSSModes.EMBED
-        self.ENABLED_MODES = [RenderModes.HTML, RenderModes.SVG, RenderModes.PNG, RenderModes.SKYASCII,
-                              RenderModes.JIANPUASCII, RenderModes.WESTERNASCII]
-        self.my_parser = Parser()  # Create a parser object
+        self.music_messages = set()
+        self.in_progress = dict()
+        self.sweeps = dict()
+        m = self.bot.metrics
+        m.reports_in_progress.set_function(lambda: len(self.in_progress))
 
-    ### Define Errors
-    # class Error(Exception):
-    #    """Base class for exceptions in this module."""
-    #    pass
-    def ask_for_mode(self, modes):
+    async def delete_progress(self, uid):
+        if uid in self.in_progress:
+            self.in_progress[uid].cancel()
+            del self.in_progress[uid]
+        if uid in self.sweeps:
+            self.sweeps[uid].cancel()
 
-        mydict = {}
-        i = 0
-        print('Please choose your note format:\n')
-        if InputModes.SKYKEYBOARD in modes:
-            i += 1
-            print(
-                str(i) + ') ' + InputModes.SKYKEYBOARD.value[2] +
-                '\n   ' +
-                self.my_parser.keyboard_layout.replace(' ', '\n   ') +
-                ':')
-            mydict[i] = InputModes.SKYKEYBOARD
-        if InputModes.SKY in modes:
-            i += 1
-            print(str(i) + ') ' + InputModes.SKY.value[2])
-            mydict[i] = InputModes.SKY
-        if InputModes.WESTERN in modes:
-            i += 1
-            print(str(i) + ') ' + InputModes.WESTERN.value[2])
-            mydict[i] = InputModes.WESTERN
-        if InputModes.JIANPU in modes:
-            i += 1
-            print(str(i) + ') ' + InputModes.JIANPU.value[2])
-            mydict[i] = InputModes.JIANPU
-        if InputModes.WESTERNCHORDS in modes:
-            i += 1
-            print(str(i) + ') ' + InputModes.WESTERNCHORDS.value[2])
-            mydict[i] = InputModes.WESTERNCHORDS
-        try:
-            song_notation = int(input("Mode (1-" + str(i) + "): ").strip())
-            mode = mydict[song_notation]
-        except (ValueError, KeyError):
-            mode = InputModes.SKY
-        return mode
+    async def sweep_trash(self, user):
+        await asyncio.sleep(Configuration.get_var("bug_trash_sweep_minutes") * 60)
+        if user.id in self.in_progress:
+            if not self.in_progress[user.id].done() or not self.in_progress[user.id].cancelled():
+                await user.send(Lang.get_string("bugs/sweep_trash"))
 
-    def is_file(self, string):
-        isfile = False
-        fp = os.path.join(self.SONG_DIR_IN, os.path.normpath(string))
-        isfile = os.path.isfile(fp)
-
-        if not (isfile):
-            fp = os.path.join(self.SONG_DIR_IN, os.path.normpath(string + '.txt'))
-            isfile = os.path.isfile(fp)
-
-        if not (isfile):
-            fp = os.path.join(os.path.normpath(string))
-            isfile = os.path.isfile(fp)
-
-        if not (isfile):
-            splitted = os.path.splitext(string)
-            if len(splitted[0]) > 0 and len(splitted[1]) > 2 and len(splitted[1]) <= 5:  # then probably a file name
-                while not (isfile) and len(fp) > 2:
-                    print('\nFile not found.')
-                    isfile, fp = self.is_file(input(
-                        'File name (in ' + os.path.normpath(self.SONG_DIR_IN) + '/): ').strip())
-
-        return isfile, fp
+            await self.delete_progress(user.id)
 
     @commands.command(aliases=['ts', 'song'])
     async def transcribe_song(self, ctx):
-        ### Change directory
-        # mycwd = os.getcwd()
-        # os.chdir("..")
-        # if not os.path.isdir(self.SONG_DIR_OUT):
-        #     os.mkdir(self.SONG_DIR_OUT)
 
-        ### MAIN SCRIPT
+        m = self.bot.metrics
+        active_question = None
+        restarting = False
 
-        start_prompt = Lang.get_string('music/start_prompt_01')
+        # Parameters that can be changed by advanced users
+        QUAVER_DELIMITER = '-'  # Dash-separated list of chords
+        ICON_DELIMITER = ' '  # Chords separation
+        PAUSE = '.'
+        COMMENT_DELIMITER = '#'  # Lyrics delimiter, can be used for comments
+        REPEAT_INDICATOR = '*'
+        SONG_DIR_IN = 'test_songs'
+        MUSIC_SUBMODULE_PATH = 'sky-python-music-sheet-maker'
+        SONG_DIR_OUT = 'songs_out'
+        CSS_PATH = 'css/main.css'
+        CSS_MODE = CSSModes.EMBED
+        ENABLED_MODES = [RenderModes.SKYASCII, RenderModes.PNG]
 
-        qwer = self.my_parser.keyboard_layout.replace(' ', '\n   ')
-        qwer = re.sub(r'(\w)', r'\1 ', qwer)
-        mode2 = str(InputModes.SKY.value[2]).split('\n')
-        abc123 = mode2.pop(0)
-        abc123 += "```"+'\n'.join(mode2)+"```"
+        mycwd = os.getcwd()
 
-        start_prompt += f"""
-{Emoji.get_chat_emoji("YES")} {InputModes.SKYKEYBOARD.value[2]}```
-   {qwer}```
+        if not os.path.isdir(os.path.join(MUSIC_SUBMODULE_PATH, SONG_DIR_OUT)):
+            os.mkdir(os.path.join(MUSIC_SUBMODULE_PATH, SONG_DIR_OUT))
 
-{Emoji.get_chat_emoji("YES")} {abc123}
+        SONG_DIR_OUT = os.path.join(MUSIC_SUBMODULE_PATH, SONG_DIR_OUT)
 
-{Emoji.get_chat_emoji("YES")} {InputModes.WESTERN.value[2]}
+        # delete the author's message
 
-{Emoji.get_chat_emoji("YES")} {InputModes.JIANPU.value[2]}
+        # start a dm
+        try:
+            channel = await ctx.author.create_dm()
+            asking = True
 
-{Emoji.get_chat_emoji("YES")} {InputModes.WESTERNCHORDS.value[2]}
-"""
-        start_prompt += '\n'
-        start_prompt += Lang.get_string('music/start_prompt_02',
-                                        ICON_DELIMITER=self.ICON_DELIMITER,
-                                        PAUSE=self.PAUSE,
-                                        QUAVER_DELIMITER=self.QUAVER_DELIMITER,
-                                        REPEAT_INDICATOR=self.REPEAT_INDICATOR)
+            async def abort():
+                nonlocal asking
+                await ctx.author.send(Lang.get_string("bugs/abort_report"))
+                asking = False
+                m.reports_abort_count.inc()
+                m.reports_exit_question.observe(active_question)
+                await self.delete_progress(ctx.author.id)
 
-        await ctx.send(start_prompt)
+            def max_length(length):
+                def real_check(text):
+                    if len(text) > length:
+                        return Lang.get_string("music/text_too_long", max=length)
+                    return True
+
+                return real_check
+
+            #
+            song = await Questions.ask_text(self.bot, channel, ctx.author,
+                                            Lang.get_string("music/start_prompt_01",
+                                                            PAUSE=PAUSE,
+                                                            QUAVER_DELIMITER=QUAVER_DELIMITER,
+                                                            REPEAT_INDICATOR=REPEAT_INDICATOR,
+                                                            COMMENT_DELIMITER=COMMENT_DELIMITER,
+                                                            max=100),
+                                            validator=max_length(2000))
+            myparser = SongParser()
+
+            song_lines = song.split('\n')
+            print(song_lines)
+
+            possible_modes = myparser.get_possible_modes(song_lines)
+
+            if len(possible_modes) > 1:
+                await channel.send('\nSeveral possible notations detected.\n Please choose your note format:\n')
+
+                mydict = {}
+                i = 0
+                for mode in possible_modes:
+                    i += 1
+                    await channel.send(str(i) + ') ' + mode.value[2])
+                    if mode == InputModes.SKYKEYBOARD:
+                        await channel.send('   ' + myparser.get_keyboard_layout().replace(' ', '\n   ') + ':')
+                    mydict[i] = mode
+                try:
+                    notation = await Questions.ask_text(self.bot, channel, ctx.author,
+                                                        "Mode (1-" + str(i) + "): ",
+                                                        validator=max_length(50))
+                    song_notation = mydict[int(notation.strip())]
+                except (ValueError, KeyError):
+                    song_notation = InputModes.SKY
+
+            elif len(possible_modes) == 0:
+                await channel.send('\nCould not detect your note format. Maybe your song contains typo errors?\nPlease choose your note format:\n')
+                mydict = {}
+                i = 0
+                for mode in possible_modes:
+                    i += 1
+                    await channel.send(str(i) + ') ' + mode.value[2])
+                    if mode == InputModes.SKYKEYBOARD:
+                        await channel.send('   ' + myparser.get_keyboard_layout().replace(' ', '\n   ') + ':')
+                    mydict[i] = mode
+                try:
+                    notation = await Questions.ask_text(self.bot, channel, ctx.author,
+                                                        "Mode (1-" + str(i) + "): ",
+                                                        validator=max_length(50))
+                    song_notation = mydict[int(notation.strip())]
+                except (ValueError, KeyError):
+                    song_notation = InputModes.SKY
+            else:
+                await channel.send(
+                    '\nWe detected that you use the following notation: ' + possible_modes[0].value[1] + '.')
+                song_notation = possible_modes[0]
+
+            myparser.set_input_mode(song_notation)
+
+            if song_notation == InputModes.JIANPU and PAUSE != '0':
+                await channel.send('\nWarning: pause in Jianpu has been reset to ''0''.')
+                PAUSE = '0'
+
+            myparser.set_delimiters(ICON_DELIMITER, PAUSE, QUAVER_DELIMITER, COMMENT_DELIMITER, REPEAT_INDICATOR)
+
+            possible_keys = []
+            song_key = None
+            if song_notation in [InputModes.ENGLISH, InputModes.DOREMI, InputModes.JIANPU]:
+                possible_keys = myparser.find_key(song_lines)
+                if len(possible_keys) == 0:
+                    await channel.send("\nYour song cannot be transposed exactly in Sky.")
+                    # trans = input('Enter a key or a number to transpose your song within the chromatic scale:')
+                    await channel.send("\nDefault key will be set to C.")
+                    song_key = 'C'
+                elif len(possible_keys) == 1:
+                    song_key = str(possible_keys[0])
+                    await channel.send("\nYour song can be transposed in Sky with the following key: " + song_key)
+                else:
+
+                    await channel.send(
+                        "\nYour song can be transposed in Sky with the following keys: " + ', '.join(possible_keys))
+
+                    while song_key not in possible_keys:
+                        song_key = await Questions.ask_text(self.bot, channel, ctx.author,
+                                                            Lang.get_string("music/choose_key"),
+                                                            validator=max_length(3))
+            else:
+                song_key = 'C'
+
+            song_title = await Questions.ask_text(self.bot, channel, ctx.author,
+                                                  Lang.get_string("music/song_title", max=200),
+                                                  validator=max_length(200))
+
+            if song_title == '':
+                song_title = str(ctx.author) + 'untitled'  # TODO: generate random title to avoid clashes
+
+            # Parses song line by line
+            english_song_key = myparser.english_note_name(song_key)
+            note_shift = 0
+            mysong = Song(english_song_key)  # The song key must be in English format
+            for song_line in song_lines:
+                instrument_line = myparser.parse_line(song_line, song_key,
+                                                      note_shift)  # The song key must be in the original format
+                mysong.add_line(instrument_line)
+
+            mysong.set_title(song_title)
+
+            if RenderModes.PNG in ENABLED_MODES:
+                png_path0 = os.path.join(SONG_DIR_OUT, song_title + '.png')
+                file_count, png_path = mysong.write_png(png_path0)
+
+                # upload attachments
+
+                if png_path != '':
+                    my_files = []
+
+                    for file_idx in range(file_count + 1):
+
+                        if file_idx == 0:
+                            file_idx = ''
+                        my_files.append(File(os.path.join(SONG_DIR_OUT, song_title + str(file_idx) + '.png')))
+
+                await channel.send(files=my_files)
+
+            if RenderModes.SKYASCII in ENABLED_MODES and song_notation not in [InputModes.SKY, InputModes.SKYKEYBOARD]:
+                await channel.send('```\n' + mysong.write_ascii(RenderModes.SKYASCII) + '\n```')
+            # await ctx.send(mysong.write_ascii(RenderModes.SKYASCII))
+
+            await ctx.send("Song complete.")
+
+        except Forbidden as ex:
+            m.bot_cannot_dm_member.inc()
+            await ctx.send(
+                Lang.get_string("music/dm_unable", user=ctx.author.mention),
+                delete_after=30)
+
+        except asyncio.TimeoutError as ex:
+            m.report_incomplete_count.inc()
+            await channel.send(Lang.get_string("bugs/report_timeout"))
+            if active_question is not None:
+                m.reports_exit_question.observe(active_question)
+            self.bot.loop.create_task(self.delete_progress(ctx.author.id))
+        except CancelledError as ex:
+            m.report_incomplete_count.inc()
+            if active_question is not None:
+                m.reports_exit_question.observe(active_question)
+            if not restarting:
+                raise ex
+        except Exception as ex:
+            self.bot.loop.create_task(self.delete_progress(ctx.author.id))
+            await Utils.handle_exception("bug reporting", self.bot, ex)
+            raise ex
+        else:
+            self.bot.loop.create_task(self.delete_progress(ctx.author.id))
+
         return
 
-        first_line = input(
-            'Type or copy-paste notes, or enter file name (in ' + os.path.normpath(self.SONG_DIR_IN) + '/): ').strip()
-
-        isfile, fp = is_file(first_line)
-
-        song_lines = []
-        if isfile:
-            try:
-                for song_line in open(fp, mode='r', encoding='utf-8', errors='ignore'):
-                    song_lines.append(song_line)
-            except (OSError, IOError) as err:
-                print('Error opening file.')
-                raise err
-            print('(Song imported from ' + os.path.abspath(fp) + ')')
-        else:
-            song_line = first_line
-            while song_line:
-                song_line = song_line.split(os.linesep)
-                for line in song_line:
-                    song_lines.append(line)
-                song_line = input('Type next line: ')
-
-        possible_modes = self.my_parser.detect_input_type(song_lines, ICON_DELIMITER, PAUSE, QUAVER_DELIMITER,
-                                                    COMMENT_DELIMITER, REPEAT_INDICATOR)
-
-        if len(possible_modes) > 1:
-            print('\nSeveral possible notations detected.')
-            song_notation = ask_for_mode(possible_modes)
-        elif len(possible_modes) == 0:
-            print('\nCould not detect your note format. Maybe your song contains typo errors?')
-            song_notation = ask_for_mode(possible_modes)
-        else:
-            print('\nWe detected that you use the following notation: ' + possible_modes[0].value[1] + '.')
-            song_notation = possible_modes[0]
-
-        if song_notation == 'JIANPU' and QUAVER_DELIMITER == '-':
-            print('\nWarning: quaver delimiter \'-\' is incompatible with Jianpu notation. Please use \'^\' instead.')
-            QUAVER_DELIMITER = '^'
-
-        # Attempts to detect key for input written in absolute musical scales (western, Jianpu)
-        musickeys = []
-        if song_notation in [InputModes.WESTERN, InputModes.JIANPU]:
-            musickeys = self.my_parser.find_key(song_lines, COMMENT_DELIMITER, song_notation)
-            if len(musickeys) == 0:
-                print("\nYour song cannot be transposed exactly in Sky.")
-            else:
-                print("\nYour song can be transposed in Sky with the following keys: " + str(musickeys))
-                print('Transposition is not implemented yet. Assuming you will play in \'C\'.')
-
-        if song_notation in [InputModes.WESTERN, InputModes.JIANPU, InputModes.WESTERNCHORDS]:
-            try:
-                note_shift = int(input('Shift notes by n positions ? (-21 ; +21): ').strip())
-            except ValueError:
-                note_shift = 0
-        else:
-            note_shift = 0
-
-        # Parses song line by line
-        mysong = Song()
-        for song_line in song_lines:
-            instrument_line = self.my_parser.parse_line(song_line, ICON_DELIMITER, PAUSE, QUAVER_DELIMITER, COMMENT_DELIMITER,
-                                                  song_notation, note_shift, REPEAT_INDICATOR)
-            mysong.add_line(instrument_line)
-
-        print('============================================================')
-        error_ratio = mysong.get_num_broken() / max(1, mysong.get_num_instruments())
-        if error_ratio == 0:
-            print('Song successfully read with no errors!')
-        elif error_ratio < 0.05:
-            print('Song successfully read with few errors!')
-        else:
-            print('Your song contains many errors.')
-        print('\nPlease fill song info or press ENTER to skip:')
-        if len(musickeys) > 0:
-            musical_key = musickeys[0]
-        else:
-            musical_key = input('Recommended key to play the visual pattern: ')
-
-        song_title = input('Song title (also used for the file name): ')
-        if song_title == '':
-            song_title = 'untitled'
-        original_artists = input('Original artist(s): ')
-        transcript_writer = input('Transcribed by: ')
-
-        # Renders the song
-        mysong.set_title(song_title)
-        mysong.set_headers(original_artists, transcript_writer, musical_key)
-
-        if RenderModes.HTML in ENABLED_MODES:
-            html_path = os.path.join(SONG_DIR_OUT, song_title + '.html')
-            html_path = mysong.write_html(html_path, NOTE_WIDTH, CSS_MODE, CSS_PATH)
-
-            if html_path != '':
-                print('============================================================')
-                print('Your song in HTML is located at:', html_path)
-
-        if RenderModes.SVG in ENABLED_MODES:
-            svg_path0 = os.path.join(SONG_DIR_OUT, song_title + '.svg')
-            filenum, svg_path = mysong.write_svg(svg_path0, CSS_MODE, CSS_PATH)
-
-            if svg_path != '':
-                print('--------------------------------------------------')
-                print('Your song in SVG is located in:', SONG_DIR_OUT)
-                print('Your song has been split into ' + str(filenum + 1) + ' files '
-                                                                            'between ' + os.path.split(svg_path0)[
-                          1] + ' and ' + os.path.split(svg_path)[1])
-
-        if RenderModes.PNG in ENABLED_MODES:
-            png_path0 = os.path.join(SONG_DIR_OUT, song_title + '.png')
-            filenum, png_path = mysong.write_png(png_path0)
-
-            if png_path != '':
-                print('--------------------------------------------------')
-                print('Your song in PNG is located in:', SONG_DIR_OUT)
-                print('Your song has been split into ' + str(filenum + 1) + ' files '
-                                                                            'between ' + os.path.split(png_path0)[
-                          1] + ' and ' + os.path.split(png_path)[1])
-
-        if RenderModes.SKYASCII in ENABLED_MODES:
-            if song_notation in [InputModes.WESTERN, InputModes.JIANPU, InputModes.WESTERNCHORDS]:
-                sky_ascii_path = os.path.join(SONG_DIR_OUT, song_title + '_sky.txt')
-                res = mysong.write_ascii(sky_ascii_path, RenderModes.SKYASCII)
-                if sky_ascii_path != '':
-                    print('--------------------------------------------------')
-                    print('Your song in TXT converted to Sky notation is located at:', sky_ascii_path)
-
-        if RenderModes.WESTERNASCII in ENABLED_MODES:
-            if song_notation in [InputModes.SKY, InputModes.SKYKEYBOARD]:
-                western_ascii_path = os.path.join(SONG_DIR_OUT, song_title + '_western.txt')
-                western_ascii_path = mysong.write_ascii(western_ascii_path, RenderModes.WESTERNASCII)
-                if western_ascii_path != '':
-                    print('--------------------------------------------------')
-                    print('Your song in TXT converted to Western notation is located at:', western_ascii_path)
-
-        os.chdir(mycwd)
 
 def setup(bot):
     bot.add_cog(Music(bot))
